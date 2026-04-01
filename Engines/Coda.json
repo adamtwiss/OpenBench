@@ -1,5 +1,5 @@
 {
-    "private" : true,
+    "private" : false,
     "nps"     : 1100000,
     "source"  : "https://github.com/adamtwiss/coda",
 
