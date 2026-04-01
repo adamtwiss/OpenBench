@@ -1,6 +1,6 @@
 {
     "private" : false,
-    "nps"     : 1100000,
+    "nps"     : 500000,
     "source"  : "https://github.com/adamtwiss/coda",
 
     "build" : {
