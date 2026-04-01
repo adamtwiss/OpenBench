@@ -20,3 +20,4 @@ Media/Events/*
 
 *.lock
 *.epd
+.env
