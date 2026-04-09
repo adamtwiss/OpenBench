@@ -1,6 +1,6 @@
 {
     "client_version"     : 43,
-    "client_repo_url"    : "https://github.com/AndyGrant/OpenBench",
+    "client_repo_url"    : "https://github.com/adamtwiss/OpenBench",
     "client_repo_ref"    : "master",
 
     "fastchess_min_version" : "1.7.0",
@@ -28,26 +28,6 @@
     ],
 
     "engines" : [
-        "4ku",
-        "Berserk",
-        "Bit-Genie",
-        "BlackMarlin",
-	"Coda",
-        "Demolito",
-        "Drofa",
-        "Equisetum",
-        "Ethereal",
-        "FabChess",
-        "Halogen",
-        "Igel",
-        "Koivisto",
-        "Laser",
-        "RubiChess",
-        "Seer",
-        "Stash",
-        "Stockfish",
-        "Weiss",
-        "Winter",
-        "Zahak"
+	"Coda"
     ]
 }
