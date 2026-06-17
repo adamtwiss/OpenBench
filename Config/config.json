@@ -28,6 +28,7 @@
     ],
 
     "engines" : [
-	"Coda"
+	"Coda",
+	"Stockfish"
     ]
 }
