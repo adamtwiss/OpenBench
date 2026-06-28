@@ -5,6 +5,20 @@
 # Configuration is per-machine via environment or defaults below.
 # Threads auto-detected from nproc. Identity from hostname.
 
+# --- Self-sufficient environment ---------------------------------------------
+# Do NOT rely on ~/.bashrc ordering. ~/.bashrc returns early for non-interactive
+# shells (the `[ -z "$PS1" ]` / `case $-` guard), so anything placed below that
+# guard (cargo's PATH, OPENBENCH_PASSWORD) is invisible to a worker launched via
+# ssh, cron, systemd, or after a reboot. Source what the worker needs here so it
+# works regardless of how it was started:
+#   - cargo on PATH: required to BUILD the Coda engine. Without it the worker
+#     reports "Coda | Missing ['cargo']" and the server assigns it no Coda work
+#     (it sits in an endless "Requesting Workload" loop, invisible on /machines/).
+#   - ~/.ob-worker.env (optional): a dedicated file for OPENBENCH_PASSWORD etc.,
+#     decoupled from ~/.bashrc entirely.
+[ -f "$HOME/.cargo/env" ]     && . "$HOME/.cargo/env"
+[ -f "$HOME/.ob-worker.env" ] && . "$HOME/.ob-worker.env"
+
 OB_DIR="${HOME}/code/OpenBench/Client"
 OB_USER="${OPENBENCH_USERNAME:-worker}"
 OB_PASS="${OPENBENCH_PASSWORD}"
@@ -18,6 +32,18 @@ start() {
     if [ -f "$OB_PIDFILE" ] && kill -0 "$(cat $OB_PIDFILE)" 2>/dev/null; then
         echo "OB worker already running (PID $(cat $OB_PIDFILE))"
         return 1
+    fi
+
+    # Fail loudly instead of launching a worker that crashes/idles silently.
+    if [ -z "$OB_PASS" ]; then
+        echo "ERROR: OPENBENCH_PASSWORD is empty — not starting (client.py would crash"
+        echo "  with KeyError on startup). Set it ABOVE the non-interactive guard in"
+        echo "  ~/.bashrc, or in ~/.ob-worker.env."
+        exit 1
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "WARNING: 'cargo' is not on PATH — this worker cannot build Coda and the"
+        echo "  server will assign it no Coda work. Ensure ~/.cargo/env exists (rustup)."
     fi
 
     echo "Starting OB worker on $(hostname): ${OB_THREADS} threads as '${OB_IDENTITY}'"
