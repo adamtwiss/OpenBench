@@ -179,8 +179,10 @@ def check_for_engine_binary(out_path):
 
 def makefile_command(net_path, make_path, out_path, compiler):
 
-    # Build with -j, and EXE= to contol the output location
-    command = ['make', '-j', 'EXE=%s' % (out_path)]
+    # Build with -j, and EXE= to contol the output location.
+    # TUNE=1 makes Coda's Makefile advertise its SPSA tunable UCI options (needed for
+    # SPSA to setoption them); for engines that don't use TUNE it's an ignored make var.
+    command = ['make', '-j', 'EXE=%s' % (out_path), 'TUNE=1']
 
     # Build with CC/CXX= when using a custom compiler
     if compiler:
