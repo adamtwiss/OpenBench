@@ -28,6 +28,14 @@ OB_IDENTITY="${OPENBENCH_IDENTITY:-$(hostname)}"
 OB_PIDFILE="/tmp/ob-worker.pid"
 OB_LOGFILE="/tmp/ob-worker.log"
 
+# Syzygy tablebases (optional, auto-detected). The client probes upward from
+# 3-man at startup and reports `syzygy_max`; the server then excludes any
+# workload asking for more pieces than this machine has (get_workload.py).
+# Passing a non-existent path is harmless but pointless, so only pass it when
+# the directory is actually there — hosts without tablebases keep working
+# exactly as before and simply never receive EGTB workloads.
+OB_SYZYGY="${OPENBENCH_SYZYGY:-$HOME/chess/tablebases}"
+
 start() {
     if [ -f "$OB_PIDFILE" ] && kill -0 "$(cat $OB_PIDFILE)" 2>/dev/null; then
         echo "OB worker already running (PID $(cat $OB_PIDFILE))"
@@ -49,6 +57,12 @@ start() {
     echo "Starting OB worker on $(hostname): ${OB_THREADS} threads as '${OB_IDENTITY}'"
     cd "$OB_DIR" || { echo "Error: $OB_DIR not found"; exit 1; }
 
+    SYZYGY_ARG=""
+    if [ -d "$OB_SYZYGY" ]; then
+        SYZYGY_ARG="--syzygy $OB_SYZYGY"
+        echo "  Syzygy: $OB_SYZYGY (client will report the max piece count it finds)"
+    fi
+
     nohup python3 client.py \
         -U "$OB_USER" \
         -P "$OB_PASS" \
@@ -56,6 +70,7 @@ start() {
         --threads "$OB_THREADS" \
         -N 1 \
         -I "$OB_IDENTITY" \
+        $SYZYGY_ARG \
         >> "$OB_LOGFILE" 2>&1 &
 
     echo $! > "$OB_PIDFILE"
@@ -108,6 +123,11 @@ status() {
         UPTIME=$(ps -o etime= -p "$PID" 2>/dev/null | tr -d ' ')
         echo "OB worker running (PID $PID, uptime: $UPTIME)"
         echo "  Host: $(hostname), Threads: $OB_THREADS, Identity: $OB_IDENTITY"
+        if [ -d "$OB_SYZYGY" ]; then
+            echo "  Syzygy: $OB_SYZYGY ($(ls "$OB_SYZYGY"/*.rtbw 2>/dev/null | wc -l) WDL files)"
+        else
+            echo "  Syzygy: none ($OB_SYZYGY absent) — no EGTB workloads"
+        fi
         tail -1 "$OB_LOGFILE" 2>/dev/null | sed 's/^/  Last log: /'
     else
         # Check for orphan process
