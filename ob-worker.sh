@@ -1,6 +1,6 @@
 #!/bin/bash
 # OpenBench worker launcher
-# Usage: ob-worker.sh [start|stop|status|restart]
+# Usage: ob-worker.sh [start|stop|status|restart|dedupe]
 #
 # Configuration is per-machine via environment or defaults below.
 # Threads auto-detected from nproc. Identity from hostname.
@@ -140,11 +140,39 @@ status() {
     fi
 }
 
+# Kill any client.py for this identity that is NOT the one recorded in the
+# pidfile (a second `start` with a stale pidfile leaves two clients running and
+# the machine listed twice on the server). Children (fastchess, engines) of the
+# stray client go with it. Keeps the pidfile process untouched.
+dedupe() {
+    KEEP=""
+    if [ -f "$OB_PIDFILE" ] && kill -0 "$(cat "$OB_PIDFILE")" 2>/dev/null; then
+        KEEP="$(cat "$OB_PIDFILE")"
+    fi
+    FOUND=0
+    for PID in $(pgrep -f "python3 client.py .*-I.*${OB_IDENTITY}"); do
+        [ "$PID" = "$KEEP" ] && continue
+        [ "$PID" = "$$" ] && continue
+        FOUND=1
+        echo "Killing stray OB client PID $PID (pidfile has '${KEEP:-none}')"
+        pkill -P "$PID" 2>/dev/null
+        kill "$PID" 2>/dev/null
+        sleep 1
+        kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
+    done
+    if [ -z "$KEEP" ] && [ "$FOUND" = 1 ]; then
+        echo "No live pidfile process: all clients killed; run '$0 start' to bring one back"
+    elif [ "$FOUND" = 0 ]; then
+        echo "No stray client (running: ${KEEP:-none})"
+    fi
+}
+
 case "${1:-status}" in
     start)   start ;;
     stop)    stop ;;
     restart) stop; sleep 2; start ;;
     status)  status ;;
+    dedupe)  dedupe ;;
     log)     tail -f "$OB_LOGFILE" ;;
     *)       echo "Usage: $0 {start|stop|restart|status|log}" ;;
 esac
