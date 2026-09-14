@@ -150,10 +150,14 @@ dedupe() {
         KEEP="$(cat "$OB_PIDFILE")"
     fi
     FOUND=0
-    for PID in $(pgrep -f "python3 client.py .*-I.*${OB_IDENTITY}"); do
+    # Match any client.py process pointed at an OpenBench server, whatever the
+    # interpreter path, working directory or identity flag it was started with.
+    CANDIDATES="$(pgrep -f 'client\.py.*-S ' | grep -v -x "$$")"
+    echo "OB clients found: $(echo $CANDIDATES | tr '\n' ' ') (pidfile: ${KEEP:-none})"
+    for PID in $CANDIDATES; do
         [ "$PID" = "$KEEP" ] && continue
-        [ "$PID" = "$$" ] && continue
         FOUND=1
+        echo "  $PID: $(ps -o lstart= -p "$PID") $(ps -o args= -p "$PID" | cut -c1-90)"
         echo "Killing stray OB client PID $PID (pidfile has '${KEEP:-none}')"
         pkill -P "$PID" 2>/dev/null
         kill "$PID" 2>/dev/null
