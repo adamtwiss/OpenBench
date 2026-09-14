@@ -152,7 +152,9 @@ dedupe() {
     FOUND=0
     # Match any client.py process pointed at an OpenBench server, whatever the
     # interpreter path, working directory or identity flag it was started with.
-    CANDIDATES="$(pgrep -f 'client\.py.*-S ' | grep -v -x "$$")"
+    # Anchored on the interpreter so a shell whose command line merely mentions
+    # the client (an ssh or tool wrapper running this script) can never match.
+    CANDIDATES="$(pgrep -f '^([^ ]*/)?python[0-9.]* ([^ ]*/)?client\.py ' | grep -v -x "$$")"
     echo "OB clients found: $(echo $CANDIDATES | tr '\n' ' ') (pidfile: ${KEEP:-none})"
     for PID in $CANDIDATES; do
         [ "$PID" = "$KEEP" ] && continue
