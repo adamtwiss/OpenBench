@@ -22,7 +22,8 @@
 # >>> create_workload(request, type)
 #
 # A Workload can be a "TEST", which is an SPRT, or FIXED type.
-# A Workload can be a "TUNE", which is an SPSA tuning session
+# A Workload can be a "TUNE", which is an SPSA tuning session.
+# A Workload can be a "DATAGEN", which is a FIXED length datagen.
 #
 # This module will either create the workload and return the user to the index,
 # which will display their newly created test. Or it will return them to index,
@@ -30,15 +31,17 @@
 # if the Base branch appears ahead of the Dev branch.
 
 import math
+import requests
 
 from django.db import transaction
 
+import OpenBench.model_utils
 import OpenBench.spsa_utils
 import OpenBench.utils
 import OpenBench.views
 
-from OpenBench.models import *
 from OpenBench.config import OPENBENCH_CONFIG
+from OpenBench.models import *
 from OpenBench.workloads.verify_workload import verify_workload
 
 def create_workload(request, workload_type):
@@ -53,7 +56,19 @@ def create_workload(request, workload_type):
 
     if request.method == 'GET':
 
-        data = { 'networks' : list(Network.objects.all().values()) }
+        engines = EngineConfig.objects.filter(enabled=True).order_by('name')
+
+        data = {
+            'networks' : list(Network.objects.all().values()),
+            'books'    : Book.objects.filter(enabled=True).order_by('name'),
+            'engines'  : engines,
+
+            # The presets, nps and source are all applied by create_workload.js
+            'engine_configs' : {
+                engine.name : OpenBench.model_utils.engine_config_to_dict(engine)
+                for engine in engines
+            },
+        }
 
         if workload_type == 'TEST':
             data['workload']        = workload_type
@@ -91,7 +106,7 @@ def create_workload(request, workload_type):
         paths = { 'TEST' : '/test/new/', 'TUNE' : '/tune/new/', 'DATAGEN' : '/datagen/new/' }
         return OpenBench.views.redirect(request, paths[workload_type], error='\n'.join(errors))
 
-    if warning := OpenBench.utils.branch_is_out_of_date(workload):
+    if warning := branch_is_out_of_date(workload):
         warning = 'Consider Rebasing: Dev (%s) appears behind Base (%s)' % (workload.dev.name, workload.base.name)
 
     username = request.user.username
@@ -107,9 +122,7 @@ def create_workload(request, workload_type):
 def create_new_test(request):
 
     # Collects erros, and collects all data from the Github API
-    errors, engine_info = verify_workload(request, 'TEST')
-    dev_info, dev_has_all = engine_info[0]
-    base_ingo, base_has_all = engine_info[1]
+    errors, (dev_info, base_info) = verify_workload(request, 'TEST')
 
     if errors:
         return None, errors
@@ -118,15 +131,16 @@ def create_new_test(request):
     test.author            = request.user.username
     test.book_name         = request.POST['book_name']
     test.upload_pgns       = request.POST['upload_pgns']
+    test.info              = dev_info[4]
 
-    test.dev               = get_engine(*dev_info)
+    test.dev               = Engine.objects.create(name=dev_info[1], source=dev_info[0], sha=dev_info[2], bench=dev_info[3])
     test.dev_repo          = request.POST['dev_repo']
     test.dev_engine        = request.POST['dev_engine']
     test.dev_options       = request.POST['dev_options']
     test.dev_network       = request.POST['dev_network']
     test.dev_time_control  = OpenBench.utils.TimeControl.parse(request.POST['dev_time_control'])
 
-    test.base              = get_engine(*base_ingo)
+    test.base              = Engine.objects.create(name=base_info[1], source=base_info[0], sha=base_info[2], bench=base_info[3])
     test.base_repo         = request.POST['base_repo']
     test.base_engine       = request.POST['base_engine']
     test.base_options      = request.POST['base_options']
@@ -146,7 +160,6 @@ def create_new_test(request):
     test.scale_nps         = int(request.POST['scale_nps'])
 
     test.test_mode         = request.POST['test_mode']
-    test.awaiting          = not (dev_has_all and base_has_all)
 
     if test.test_mode == 'SPRT':
         test.elolower = float(request.POST['test_bounds'].split(',')[0].lstrip('['))
@@ -176,8 +189,7 @@ def create_new_test(request):
 def create_new_tune(request):
 
     # Collects erros, and collects all data from the Github API
-    errors, engine_info = verify_workload(request, 'TUNE')
-    dev_info, dev_has_all = engine_info
+    errors, dev_info = verify_workload(request, 'TUNE')
 
     if errors:
         return None, errors
@@ -186,8 +198,9 @@ def create_new_tune(request):
     test.author           = request.user.username
     test.book_name        = request.POST['book_name']
     test.upload_pgns      = request.POST['upload_pgns']
+    test.info             = request.POST['info']
 
-    test.dev              = test.base              = get_engine(*dev_info)
+    test.dev              = test.base              = Engine.objects.create(name=dev_info[1], source=dev_info[0], sha=dev_info[2], bench=dev_info[3])
     test.dev_repo         = test.base_repo         = request.POST['dev_repo']
     test.dev_engine       = test.base_engine       = request.POST['dev_engine']
     test.dev_options      = test.base_options      = request.POST['dev_options']
@@ -208,8 +221,6 @@ def create_new_tune(request):
 
     test.test_mode        = 'SPSA'
 
-    test.awaiting         = not dev_has_all
-
     if test.dev_network:
         name = Network.objects.get(engine=test.dev_engine, sha256=test.dev_network).name
         test.dev_netname = test.base_netname = name
@@ -227,9 +238,7 @@ def create_new_tune(request):
 def create_new_datagen(request):
 
     # Collects erros, and collects all data from the Github API
-    errors, engine_info = verify_workload(request, 'DATAGEN')
-    dev_info, dev_has_all = engine_info[0]
-    base_ingo, base_has_all = engine_info[1]
+    errors, (dev_info, base_info) = verify_workload(request, 'DATAGEN')
 
     if errors:
         return None, errors
@@ -238,15 +247,16 @@ def create_new_datagen(request):
     test.author            = request.user.username
     test.book_name         = request.POST['book_name']
     test.upload_pgns       = request.POST['upload_pgns']
+    test.info              = request.POST['info']
 
-    test.dev               = get_engine(*dev_info)
+    test.dev               = Engine.objects.create(name=dev_info[1], source=dev_info[0], sha=dev_info[2], bench=dev_info[3])
     test.dev_repo          = request.POST['dev_repo']
     test.dev_engine        = request.POST['dev_engine']
     test.dev_options       = request.POST['dev_options']
     test.dev_network       = request.POST['dev_network']
     test.dev_time_control  = OpenBench.utils.TimeControl.parse(request.POST['dev_time_control'])
 
-    test.base              = get_engine(*base_ingo)
+    test.base              = Engine.objects.create(name=base_info[1], source=base_info[0], sha=base_info[2], bench=base_info[3])
     test.base_repo         = request.POST['base_repo']
     test.base_engine       = request.POST['base_engine']
     test.base_options      = request.POST['base_options']
@@ -270,7 +280,6 @@ def create_new_datagen(request):
     test.scale_nps         = int(request.POST['scale_nps'])
 
     test.test_mode         = 'DATAGEN'
-    test.awaiting          = not (dev_has_all and base_has_all)
 
     test.use_tri           = not test.play_reverses
     test.use_penta         = test.play_reverses
@@ -289,10 +298,26 @@ def create_new_datagen(request):
 
     return test, None
 
-def get_engine(source, name, sha, bench):
 
-    engine = Engine.objects.filter(name=name, source=source, sha=sha, bench=bench)
-    if engine.first() != None:
-        return engine.first()
+def branch_is_out_of_date(workload):
 
-    return Engine.objects.create(name=name, source=source, sha=sha, bench=bench)
+    # Cannot compare across engines
+    if workload.dev_engine != workload.base_engine:
+        return False
+
+    # Format the request to the Github endpoint
+    base = 'https://api.github.com/repos/'
+    base = workload.dev_repo.replace('github.com', 'api.github.com/repos')
+    url  = OpenBench.utils.path_join(base, 'compare', '%s...%s' % (workload.dev.sha, workload.base.sha))
+
+    try:
+        # Out of date if ahead_by is non-zero
+        headers = OpenBench.utils.read_git_credentials(workload.dev_engine)
+        data    = requests.get(url, headers=headers).json()
+        return data.get('ahead_by', 0) > 0
+
+    except:
+        # If something went wrong, just ignore it
+        import traceback
+        traceback.print_exc()
+        return False

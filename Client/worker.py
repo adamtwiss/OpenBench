@@ -29,6 +29,7 @@ import psutil
 import queue
 import re
 import requests
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import bench
 import genfens
+import isa_detector
 import pgn_util
 import utils
 
@@ -59,10 +61,10 @@ from client import try_forever
 
 ## Basic configuration of the Client. These timeouts can be changed at will
 
-CLIENT_VERSION   = 44 # Client version to send to the Server
+CLIENT_VERSION   = 50 # Client version to send to the Server
 TIMEOUT_HTTP     = 30 # Timeout in seconds for HTTP requests
-TIMEOUT_ERROR    = 10 # Timeout in seconds when any errors are thrown
-TIMEOUT_WORKLOAD = 30 # Timeout in seconds between workload requests
+TIMEOUT_ERROR    = 60 # Timeout in seconds when any errors are thrown
+TIMEOUT_WORKLOAD = 60 # Timeout in seconds between workload requests
 REPORT_INTERVAL  = 30 # Seconds between reports to the Server
 
 IS_WINDOWS = platform.system() == 'Windows' # Don't touch this
@@ -82,6 +84,7 @@ class Configuration:
         self.git_tokens     = {}
         self.cpu_flags      = []
         self.cpu_name       = ''
+        self.isa_name       = ''
         self.os_name        = platform.system()
         self.os_ver         = platform.release()
         self.python_ver     = platform.python_version()
@@ -113,6 +116,8 @@ class Configuration:
         self.fleet       = args.fleet    if args.fleet    else False
         self.noisy       = args.noisy    if args.noisy    else False
         self.focus       = args.focus    if args.focus    else []
+        self.only        = args.only     if args.only     else []
+        self.cli_options = args.cli_options
 
     def check_requirements(self):
 
@@ -164,9 +169,6 @@ class Configuration:
 
         # For each engine, attempt to find a valid compiler
         for engine, build_info in data.items():
-
-            # Private engines don't need to be compiled
-            if build_info['private']: continue
 
             # Try to find at least one working compiler
             for compiler in build_info['compilers']:
@@ -230,6 +232,14 @@ class Configuration:
         print ('Found   |', ' '.join(self.cpu_flags))
         print ('Missing |', ' '.join([x for x in desired if x not in actual]))
 
+    def determine_isa(self):
+
+        print('\nDetermining ISA...')
+
+        # Match the machine to a Stockfish-style ISA using our C++ compiler
+        self.isa_name = isa_detector.detect_isa(self.cxx_comp)
+        print('Found   | %s' % (self.isa_name))
+
 class ServerReporter:
 
     ## Handles reporting things to the server, which are not intended to send a great
@@ -269,17 +279,6 @@ class ServerReporter:
         }
 
         return ServerReporter.report(config, 'clientSubmitNPS', payload)
-
-    @staticmethod
-    def report_missing_artifact(config, artifact_name, artifact_json):
-
-        payload = {
-            'test_id'    : config.workload['test']['id'],
-            'error'      : 'Artifact %s missing' % (artifact_name),
-            'logs'       : json.dumps(artifact_json, indent=2),
-        }
-
-        return ServerReporter.report(config, 'clientSubmitError', payload)
 
     @staticmethod
     def report_build_fail(config, branch, output):
@@ -373,6 +372,22 @@ class ServerReporter:
         }
 
         return ServerReporter.report(config, 'clientHeartbeat', payload)
+
+    @staticmethod
+    def report_nps_stats(config, stats):
+
+        payload = {
+            'test_id'          : config.workload['test']['id'],
+            'result_id'        : config.workload['result']['id'],
+            'dev_nodes'        : int(stats['dev' ]['nodes'      ]),
+            'dev_time'         : int(stats['dev' ]['time'       ]),
+            'dev_time_scaled'  : int(stats['dev' ]['time_scaled']),
+            'base_nodes'       : int(stats['base']['nodes'      ]),
+            'base_time'        : int(stats['base']['time'       ]),
+            'base_time_scaled' : int(stats['base']['time_scaled']),
+        }
+
+        return ServerReporter.report(config, 'clientSubmitNPSStats', payload)
 
     @staticmethod
     def report_pgn(config, compressed_pgn_text):
@@ -475,19 +490,12 @@ class MatchRunner:
 
         # Extract configuration from the Workload
         options = config.workload['test'][branch]['options']
-        network = config.workload['test'][branch]['network']
-        private = config.workload['test'][branch]['private']
         engine  = config.workload['test'][branch]['engine']
         syzygy  = config.workload['test']['syzygy_wdl']
 
         # Human-readable name, and scale the time control
         name    = command.replace('.exe', '')
         control = scale_time_control(config.workload, scale_factor, branch)
-
-        # Private engines, when using Networks, must set them via UCI
-        if private and network and network != 'None':
-            options += ' EvalFile=%s' % (os.path.join('../Networks', network))
-            name    += '-%s' % (network)
 
         # Set the SyzygyPath if we have them, and are allowed to use them
         if syzygy != 'DISABLED' and config.syzygy_max:
@@ -508,7 +516,9 @@ class MatchRunner:
 
     @staticmethod
     def pgnout_settings(config, timestamp, runner_idx):
-        return '-pgnout file=%s seldepth=true nodes=true' % (MatchRunner.pgn_name(config, timestamp, runner_idx))
+        match_line = '^info string pgncomment .*'
+        return '-pgnout file=%s seldepth=true nodes=true match_line=%s' % (
+            MatchRunner.pgn_name(config, timestamp, runner_idx), shlex.quote(match_line))
 
     @staticmethod
     def update_results(results, line):
@@ -775,7 +785,6 @@ def cleanup_client():
 
     SECONDS_PER_DAY   = 60 * 60 * 24
     SECONDS_PER_WEEK  = SECONDS_PER_DAY * 7
-    SECONDS_PER_MONTH = SECONDS_PER_WEEK * 4
 
     file_age = lambda x: time.time() - os.path.getmtime(x)
 
@@ -784,11 +793,11 @@ def cleanup_client():
             os.remove(os.path.join('PGNs', file))
 
     for file in os.listdir('Engines'):
-        if file_age(os.path.join('Engines', file)) > SECONDS_PER_WEEK:
+        if file_age(os.path.join('Engines', file)) > SECONDS_PER_DAY:
             os.remove(os.path.join('Engines', file))
 
     for file in os.listdir('Networks'):
-        if file_age(os.path.join('Networks', file)) > SECONDS_PER_MONTH:
+        if file_age(os.path.join('Networks', file)) > SECONDS_PER_WEEK:
             os.remove(os.path.join('Networks', file))
 
 def validate_syzygy_exists(config, K):
@@ -885,11 +894,11 @@ def find_pgn_error(reason, command):
     return data[ii] + pgn
 
 
-def determine_scale_factor(config, dev_name, dev_network, base_name, base_network):
+def determine_scale_factor(config, dev_name, base_name):
 
     # Run the benchmarks and compute the scaling NPS value
-    dev_nps  = safe_run_benchmarks(config, 'dev' , dev_name , dev_network )
-    base_nps = safe_run_benchmarks(config, 'base', base_name, base_network)
+    dev_nps  = safe_run_benchmarks(config, 'dev' , dev_name )
+    base_nps = safe_run_benchmarks(config, 'base', base_name)
     ServerReporter.report_nps(config, dev_nps, base_nps)
 
     dev_factor = base_factor = None
@@ -1002,6 +1011,7 @@ def server_configure_worker(config):
     config.scan_for_compilers(data)      # Public engine build tools
     config.scan_for_private_tokens(data) # Private engine access tokens
     config.scan_for_cpu_flags(data)      # For executing binaries
+    config.determine_isa()               # Stockfish-style ISA of this machine
     config.machine_id = None             # None, until registration occurs for a session
 
     system_info = {
@@ -1009,6 +1019,7 @@ def server_configure_worker(config):
         'tokens'         : config.git_tokens,     # Key: Engine, Value: True, for tokens we have
         'cpu_flags'      : config.cpu_flags,      # List of CPU flags found in the Client or Server
         'cpu_name'       : config.cpu_name,       # Raw CPU name as per py-cpuinfo
+        'isa_name'       : config.isa_name,       # Stockfish-style ISA, e.g. x86-64-avx2
         'os_name'        : config.os_name,        # Should be Windows, Linux, or Darwin
         'os_ver'         : config.os_ver,         # Release version of the OS
         'python_ver'     : config.python_ver,     # Python version running the Client
@@ -1023,6 +1034,8 @@ def server_configure_worker(config):
         'syzygy_max'     : config.syzygy_max,     # Whether or not the machine has Syzygy support
         'noisy'          : config.noisy,          # Whether our results are unstable for time-based workloads
         'focus'          : config.focus,          # List of engines we have a preference to help
+        'only'           : config.only,           # List of engines we are willing to help, exclusively
+        'cli_options'    : config.cli_options,    # Command line options except for credentials and server
         'cxx_comp'       : config.cxx_comp,       # C++ Compiler used to build Fastchess binaries
         'fastchess_ver'  : config.fastchess_ver,  # Fastchess Version, set during server_configure_fastchess()
         'client_ver'     : CLIENT_VERSION,        # Version of the Client, which the server may reject
@@ -1101,10 +1114,10 @@ def complete_workload(config):
 
     # Datagen creates a book on-the-fly
     if config.workload['test']['type'] == 'DATAGEN':
-        safe_create_genfens_opening_book(config, dev_name, dev_network)
+        safe_create_genfens_opening_book(config, dev_name)
 
     # Scale time control based on the Engine's local NPS
-    scale_factor = determine_scale_factor(config, dev_name, dev_network, base_name, base_network)
+    scale_factor = determine_scale_factor(config, dev_name, base_name)
 
     # Server knows how many copies of the match runner we should run
     runner_cnt      = config.workload['distribution']['runner-count']
@@ -1141,11 +1154,16 @@ def complete_workload(config):
             MatchRunner.kill_everything(dev_name, base_name)
             raise
 
+        pgn_files = [MatchRunner.pgn_name(config, timestamp, x) for x in range(runner_cnt)]
+
+        # Submit NPS stats
+        if config.workload['test']['type'] in ('SPRT', 'GAMES'):
+            ServerReporter.report_nps_stats(config, pgn_util.collect_nps_stats(pgn_files, scale_factor))
+
         # Upload the PGN if requested
         if config.workload['test']['upload_pgns'] != 'FALSE':
-            compact    = config.workload['test']['upload_pgns'] == 'COMPACT'
-            pgn_files  = [MatchRunner.pgn_name(config, timestamp, x) for x in range(runner_cnt)]
-            ServerReporter.report_pgn(config, pgn_util.compress_list_of_pgns(pgn_files, scale_factor, compact))
+            compact = config.workload['test']['upload_pgns'] == 'COMPACT'
+            ServerReporter.report_pgn(config, pgn_util.compress_pgn_files(pgn_files, scale_factor, compact))
 
 def safe_download_network_weights(config, branch):
 
@@ -1168,7 +1186,7 @@ def safe_download_network_weights(config, branch):
 
 def safe_download_engine(config, branch, net_path):
 
-    # Wraps utils.py:download_public_engine() and utils.py:download_private_engine()
+    # Wraps utils.py:prepare_engine()
 
     engine      = config.workload['test'][branch]['engine']
     branch_name = config.workload['test'][branch]['name']
@@ -1176,40 +1194,27 @@ def safe_download_engine(config, branch, net_path):
     source      = config.workload['test'][branch]['source']
     private     = config.workload['test'][branch]['private']
 
-    bin_name = utils.engine_binary_name(engine, commit_sha, net_path, private)
+    bin_name = utils.engine_binary_name(engine, commit_sha, net_path)
     out_path = os.path.join('Engines', bin_name)
 
-    if private:
+    make_path = config.workload['test'][branch]['build']['path']
+    compiler  = config.compilers[engine][0]
 
-        try:
-            return utils.download_private_engine(
-                engine, branch_name, source, out_path, config.cpu_name, config.cpu_flags)
+    try:
+        return utils.prepare_engine(engine, net_path, branch_name, source, make_path, out_path, private, compiler)
 
-        except utils.OpenBenchMissingArtifactException as error:
-            ServerReporter.report_missing_artifact(config, branch, error.name, error.logs)
-            raise
+    except utils.OpenBenchBuildFailedException as error:
 
-    else:
+        print ('Failed to build %s-%s...\n\nCompiler Output:' % (engine, branch_name))
+        for line in error.logs.split('\n'):
+            print ('> %s' % (line))
+        print ()
 
-        make_path = config.workload['test'][branch]['build']['path']
-        compiler  = config.compilers[engine][0]
+        config.blacklist.append(config.workload['test']['id'])
+        ServerReporter.report_build_fail(config, branch, error.logs)
+        raise
 
-        try:
-            return utils.download_public_engine(
-                engine, net_path, branch_name, source, make_path, out_path, compiler)
-
-        except utils.OpenBenchBuildFailedException as error:
-
-            print ('Failed to build %s-%s...\n\nCompiler Output:' % (engine, branch_name))
-            for line in error.logs.split('\n'):
-                print ('> %s' % (line))
-            print ()
-
-            config.blacklist.append(config.workload['test']['id'])
-            ServerReporter.report_build_fail(config, branch, error.logs)
-            raise
-
-def safe_create_genfens_opening_book(config, dev_name, dev_network):
+def safe_create_genfens_opening_book(config, dev_name):
 
     with open(os.path.join('Books', 'openbench.genfens.epd'), 'w') as fout:
 
@@ -1218,9 +1223,7 @@ def safe_create_genfens_opening_book(config, dev_name, dev_network):
             'book'    : genfens.genfens_book_input_name(config),
             'seeds'   : config.workload['test']['genfens_seeds'],
             'extra'   : config.workload['test']['genfens_args'],
-            'private' : config.workload['test']['dev']['private'],
             'engine'  : os.path.join('Engines', dev_name),
-            'network' : dev_network,
             'threads' : config.threads,
             'output'  : fout,
         }
@@ -1231,17 +1234,15 @@ def safe_create_genfens_opening_book(config, dev_name, dev_network):
             ServerReporter.report_engine_error(config, error.message)
             raise
 
-def safe_run_benchmarks(config, branch, engine, network):
+def safe_run_benchmarks(config, branch, engine):
 
     name     = config.workload['test'][branch]['name']
-    private  = config.workload['test'][branch]['private']
     expected = int(config.workload['test'][branch]['bench'])
     binary   = os.path.join('Engines', engine)
 
     try:
         print('\nRunning %dx Benchmarks for %s' % (config.threads, name))
-        speed, nodes = bench.run_benchmark(
-            binary, network, private, config.threads, 1, expected)
+        speed, nodes = bench.run_benchmark(binary, config.threads, 1, expected)
 
     except utils.OpenBenchBadBenchException as error:
         ServerReporter.report_bad_bench(config, error.message)
@@ -1267,7 +1268,7 @@ def build_runner_command(config, dev_cmd, base_cmd, scale_factor, timestamp, run
 def run_and_parse_runner(config, command, runner_idx, results_queue, abort_flag):
 
     print('\n[#%d] Launching match runner...\n%s\n' % (runner_idx, command))
-    runner = Popen(command.split(), stdout=PIPE)
+    runner = Popen(shlex.split(command), stdout=PIPE)
 
     results = {
 
@@ -1326,11 +1327,13 @@ def reload_local_imports():
 
     import bench
     import genfens
+    import isa_detector
     import pgn_util
     import utils
 
     importlib.reload(bench)
     importlib.reload(genfens)
+    importlib.reload(isa_detector)
     importlib.reload(pgn_util)
     importlib.reload(utils)
 
@@ -1350,12 +1353,28 @@ def parse_arguments(client_args):
     p.add_argument(      '--fleet'   , help='Fleet Mode'                  , action='store_true')
     p.add_argument(      '--noisy'   , help='Reject time-based workloads' , action='store_true')
     p.add_argument(      '--focus'   , help='Prefer certain engine(s)'    , nargs='+'          )
+    p.add_argument(      '--only'    , help='Only help certain engine(s)' , nargs='+'          )
 
     # Ignore unknown arguments ( from client )
-    worker_args, unknown = p.parse_known_args()
+    worker_args, unknown    = p.parse_known_args()
+    worker_args.cli_options = format_cli_options(worker_args)
 
     # Add the client args (Username, Password, and Server) to the worker args
     return argparse.Namespace(**{ **vars(client_args), **vars(worker_args) })
+
+def format_cli_options(worker_args):
+
+    options = []
+
+    for name, value in vars(worker_args).items():
+        if isinstance(value, list):
+            options.append('--%s %s' % (name, ' '.join(map(str, value))))
+        elif value is True:
+            options.append('--%s' % name)
+        elif value:
+            options.append('--%s %s' % (name, value))
+
+    return ' '.join(options)
 
 def run_openbench_worker(client_args):
 

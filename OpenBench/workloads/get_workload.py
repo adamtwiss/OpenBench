@@ -31,7 +31,7 @@ import sys
 import OpenBench.utils
 
 from OpenBench.config import OPENBENCH_CONFIG
-from OpenBench.models import Result, Test
+from OpenBench.models import Book, EngineConfig, Result, Test
 from OpenBench.spsa_utils import spsa_workload_assignment_dict
 
 from django.db import transaction
@@ -45,10 +45,11 @@ def get_workload(request, machine):
     # Avoid creating duplicate Result objects
     result, created = Result.objects.get_or_create(test=test, machine=machine)
 
-    # Update the Machine's status and save everything
+    # Update the Machine's status. Only the touched columns are written back,
+    # to avoid re-serializing the (large) info blob on every workload request
     machine.workload = test.id;
     machine.mnps = machine.dev_mnps = machine.base_mnps = 0.00
-    machine.save(); result.save()
+    machine.save(update_fields=['workload', 'mnps', 'dev_mnps', 'base_mnps', 'updated'])
 
     return { 'workload' : workload_to_dictionary(test, result, machine) }
 
@@ -77,35 +78,43 @@ def select_workload(request, machine):
     throughput_sum = sum(x['throughput'] for x in worker_dist.values())
     fair_ratio     = thread_sum / throughput_sum
 
+    # The candidates are already in memory, so the winner never needs a re-fetch
+    by_id = { workload.id : workload for workload in candidates }
+
     # Step 6: Repeat the same machine, if we are still within +- 25% fairness
     if machine.workload in worker_dist.keys():
         this_ratio = worker_dist[machine.workload]['ratio']
         if min_ratio / fair_ratio > 0.75 and this_ratio / fair_ratio < 1.25:
-            return Test.objects.get(id=machine.workload)
+            return by_id[machine.workload]
 
     # Step 7: Pick a random test, amongst those who share the min_ratio, weighted by throughput
     choices = [id for id, data in worker_dist.items() if data['ratio'] == min_ratio]
     weights = [data['throughput'] for id, data in worker_dist.items() if data['ratio'] == min_ratio]
-    return Test.objects.get(id=random.choices(choices, weights=weights)[0])
+    return by_id[random.choices(choices, weights=weights)[0]]
 
 def filter_valid_workloads(request, machine):
 
-    workloads = OpenBench.utils.get_active_tests()
+    # The ordering of get_active_tests() is for the GUI. It costs a sort that we
+    # do not need, since the priority refinement below is done in Python anyway
+    workloads = OpenBench.utils.get_active_tests().order_by()
 
-    # Skip engines that the Machine cannot handle
-    for engine in OPENBENCH_CONFIG['engines'].keys():
-        if engine not in machine.info['supported']:
-            workloads = workloads.exclude(dev_engine=engine)
-            workloads = workloads.exclude(base_engine=engine)
+    # Skip engines that the Machine cannot handle. Expressed as a whitelist, so
+    # the query carries two IN() clauses instead of one NOT for every engine
+    supported = machine.info['supported']
+    workloads = workloads.filter(dev_engine__in=supported, base_engine__in=supported)
+
+    # Skip every engine but our own, for --only machines
+    if only := machine.info.get('only', []):
+        workloads = workloads.filter(dev_engine__in=only)
 
     # Skip workloads that are blacklisted on the machine
     if blacklisted := request.POST.getlist('blacklist'):
         workloads = workloads.exclude(id__in=blacklisted)
 
     # Skip workloads with unmet Syzygy requirements
-    for K in range(machine.info['syzygy_max'] + 1, 10):
-        workloads = workloads.exclude(syzygy_adj='%d-MAN' % (K))
-        workloads = workloads.exclude(syzygy_wdl='%d-MAN' % (K))
+    if unmet := ['%d-MAN' % (K) for K in range(machine.info['syzygy_max'] + 1, 10)]:
+        workloads = workloads.exclude(syzygy_adj__in=unmet)
+        workloads = workloads.exclude(syzygy_wdl__in=unmet)
 
     # Skip any workload using, or measuring, Time, for --noisy workers
     if machine.info.get('noisy'):
@@ -123,13 +132,21 @@ def filter_valid_workloads(request, machine):
     candidates = [x for x in options if x.priority == max(priorities)]
 
     # Refine to workloads that match our focus, if applicable
-    focuses    = machine.info.get('focus', [])
+    focuses    = machine_focuses(machine)
     has_focus  = any(x.dev_engine in focuses for x in candidates)
 
     if has_focus:
         candidates = list(filter(lambda x: x.dev_engine in focuses, candidates))
 
     return candidates, has_focus
+
+def machine_focuses(machine):
+
+    # --only is a hard restriction, whereas --focus is merely a preference.
+    # A Machine using --only is at least as dedicated as one using --focus,
+    # therefore --only implies --focus for the purposes of the assignment
+
+    return machine.info.get('only', []) + machine.info.get('focus', [])
 
 def valid_hardware_assignment(workload, machine):
 
@@ -167,12 +184,17 @@ def compute_resource_distribution(workloads, machine, has_focus):
 
     # Ignore our own machine;
     # Ignore machines working on non-candidates;
-    # Ignore focus-assigned machines when has_focus is false
+    # Ignore focus-assigned and only-assigned machines when has_focus is false
 
-    for x in OpenBench.utils.getRecentMachines():
-        if x != machine and x.workload in worker_dist:
-            if has_focus or worker_dist[x.workload]['engine'] not in x.info.get('focus', []):
-                worker_dist[x.workload]['threads'] += x.info['concurrency']
+    # The first two are done in the database, so that we never pay to deserialize
+    # the info blob of a machine that cannot contribute to any of the candidates
+
+    others = OpenBench.utils.getRecentMachines() \
+        .filter(workload__in=list(worker_dist.keys())).exclude(id=machine.id)
+
+    for x in others:
+        if has_focus or worker_dist[x.workload]['engine'] not in machine_focuses(x):
+            worker_dist[x.workload]['threads'] += x.info['concurrency']
 
     # Count of tests that exist for a particular dev_engine
 
@@ -205,11 +227,19 @@ def workload_to_dictionary(test, result, machine):
         'scale_nps'     : test.scale_nps,
     }
 
+    # Book could have been deleted after this workload was created
+    book = Book.objects.filter(name=test.book_name).first()
+
     workload['test']['book'] = {
         'name'   : test.book_name,
-        'sha'    : OPENBENCH_CONFIG['books'].get(test.book_name, { 'sha'    : None })['sha'   ],
-        'source' : OPENBENCH_CONFIG['books'].get(test.book_name, { 'source' : None })['source'],
+        'sha'    : book.sha    if book else None,
+        'source' : book.source if book else None,
     }
+
+    # Looked up by name without regard for the enabled flag, so that disabling
+    # an Engine does not strand the Workloads already running against it
+    dev_config  = EngineConfig.objects.get(name=test.dev_engine)
+    base_config = EngineConfig.objects.get(name=test.base_engine)
 
     workload['test']['dev'] = {
         'id'           : test.dev.id,
@@ -222,8 +252,8 @@ def workload_to_dictionary(test, result, machine):
         'network'      : test.dev_network,
         'netname'      : test.dev_netname,
         'time_control' : test.dev_time_control,
-        'build'        : OPENBENCH_CONFIG['engines'][test.dev_engine]['build'],
-        'private'      : OPENBENCH_CONFIG['engines'][test.dev_engine]['private'],
+        'build'        : dev_config.build(),
+        'private'      : dev_config.private,
     }
 
     workload['test']['base'] = {
@@ -237,8 +267,8 @@ def workload_to_dictionary(test, result, machine):
         'network'      : test.base_network,
         'netname'      : test.base_netname,
         'time_control' : test.base_time_control,
-        'build'        : OPENBENCH_CONFIG['engines'][test.base_engine]['build'],
-        'private'      : OPENBENCH_CONFIG['engines'][test.base_engine]['private'],
+        'build'        : base_config.build(),
+        'private'      : base_config.private,
     }
 
     workload['distribution']   = game_distribution(test, machine)
@@ -261,7 +291,8 @@ def workload_to_dictionary(test, result, machine):
             workload['test']['genfens_seeds'] = [
                 random.randint(0, 2**31 - 1) for x in range(machine.info['concurrency'])]
 
-        test.save()
+        # Only book_index changed. Avoid holding the lock for longer than needed
+        test.save(update_fields=['book_index', 'updated'])
 
     return workload
 

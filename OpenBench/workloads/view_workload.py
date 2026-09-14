@@ -26,24 +26,26 @@
 # A Workload can be a "DATAGEN", which is a Data Generation session
 
 import datetime
-import json
+
+from collections import defaultdict
 
 from django.db.models import BooleanField, ExpressionWrapper, F, Q
 from django.utils import timezone
 
 import OpenBench.views
+import OpenBench.stats
 from OpenBench.models import *
 
 def view_workload(request, workload, workload_type):
 
     assert workload_type in [ 'TEST', 'TUNE', 'DATAGEN' ]
 
-    truncated, results = fetch_results(workload, force=False)
+    # The individual per-machine Result rows are never sent with the page; they
+    # are fetched on demand via the "Fetch Individual Results" button. The
+    # aggregate summary is fetched automatically once the page loads.
 
     data = {
-        'workload'          : workload,
-        'results'           : json.dumps(results),
-        'results_truncated' : truncated
+        'workload' : workload,
     }
 
     if workload_type == 'TEST':
@@ -60,12 +62,7 @@ def view_workload(request, workload, workload_type):
 
     return OpenBench.views.render(request, 'workload.html', data)
 
-def fetch_results(workload, force):
-
-    # Bail out when there are a large number of results, unless `force`
-    qs = Result.objects.filter(test=workload)
-    if not force and qs.count() > 25:
-        return True, []
+def fetch_results(workload):
 
     # One minute prior to now
     target = datetime.datetime.utcnow()
@@ -73,7 +70,7 @@ def fetch_results(workload, force):
     target = target - datetime.timedelta(minutes=1)
 
     # Create `active` field for current machines
-    qs = qs.select_related('machine__user').annotate(
+    qs = Result.objects.filter(test=workload).select_related('machine__user').annotate(
         active=ExpressionWrapper(
             Q(machine__updated__gte=target) &
             Q(test_id=F('machine__workload')),
@@ -81,20 +78,105 @@ def fetch_results(workload, force):
         )
     )
 
-    # Only the fields consumed by the template OpenBench/workload.html
+    # Drop Results that have played nothing and are no longer active
+    qs = qs.filter(Q(games__gt=0) | Q(active=True))
+
+    # Hand back the raw pentanomial buckets; the individual results table is
+    # formatted client-side in OpenBench/static/workload_utils.js
     qs = qs.values(
         'machine__id',
         'machine__user__username',
-        'updated',
         'games',
-        'wins',
-        'losses',
-        'draws',
+        'LL', 'LD', 'DD', 'DW', 'WW',
         'timeloss',
         'crashes',
         'active',
     )
 
-    results = [{ **result, 'updated' : result['updated'].timestamp() } for result in qs]
+    return list(qs)
 
-    return False, results
+def fetch_result_summaries(workload):
+
+    # Aggregate the pentanomial counters across every Result of the workload,
+    # grouped three ways: by the User who ran it, and by the reporting Machine's
+    # cpu_name and isa_name. We only ever sum penta; the trinomial counts and
+    # crash/timeloss/active fields are intentionally left out.
+    qs = Result.objects.filter(test=workload).select_related('machine__user')
+    qs = qs.values(
+        'machine__user__username',
+        'machine__info',
+        'LL', 'LD', 'DD', 'DW', 'WW',
+        'dev_nodes',
+        'dev_time',
+        'dev_time_scaled',
+        'base_nodes',
+        'base_time',
+        'base_time_scaled',
+    )
+
+    by_user = defaultdict(lambda: [0, 0, 0, 0, 0])
+    by_cpu  = defaultdict(lambda: [0, 0, 0, 0, 0])
+    by_isa  = defaultdict(lambda: [0, 0, 0, 0, 0])
+
+    nps_user = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
+    nps_cpu  = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
+    nps_isa  = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
+
+    def accumulate(bucket, key, values):
+        total = bucket[key if key else 'Unknown']
+        for i in range(len(values)):
+            total[i] += values[i]
+
+    for row in qs:
+        user  = row['machine__user__username']
+        info  = row['machine__info'] or {}
+        cpu   = info.get('cpu_name')
+        isa   = info.get('isa_name')
+
+        penta = (row['LL'], row['LD'], row['DD'], row['DW'], row['WW'])
+
+        accumulate(by_user, user, penta);
+        accumulate(by_cpu,  cpu,  penta);
+        accumulate(by_isa,  isa,  penta);
+
+        nodes = (
+            row['dev_nodes'], row['dev_time'], row['dev_time_scaled'],
+            row['base_nodes'], row['base_time'], row['base_time_scaled']
+        )
+
+        accumulate(nps_user, user, nodes)
+        accumulate(nps_cpu,  cpu,  nodes)
+        accumulate(nps_isa,  isa,  nodes)
+
+    # Turn a { key: penta } bucket into ready-to-display rows: the penta as a
+    # single "(a, b, c, d, e)" string, a point-estimate Elo with its symmetric
+    # error bar, the pair count, and the share of the grouping's total. Largest
+    # contributor comes first.
+
+    def elo_display(penta):
+        lower, mu, upper = OpenBench.stats.Elo(penta)
+        return '%.2f ± %.2f' % (mu, (upper - lower) / 2)
+
+    def summarize(bucket, nps_stats):
+        def compute_nps(nodes, time_ms):
+            return round((1000 * nodes) / time_ms) if nodes else 0
+
+        total_pairs = sum(sum(penta) for penta in bucket.values())
+        rows = [{
+            'key'             : key,
+            'penta'           : '(%d, %d, %d, %d, %d)' % tuple(penta),
+            'elo'             : elo_display(penta),
+            'pairs'           : sum(penta),
+            'percent'         : '%.2f' % (100.0 * sum(penta) / total_pairs if total_pairs else 0.0),
+            'dev_nps'         : compute_nps(nps_stats[key][0], nps_stats[key][1]),
+            'dev_nps_scaled'  : compute_nps(nps_stats[key][0], nps_stats[key][2]),
+            'base_nps'        : compute_nps(nps_stats[key][3], nps_stats[key][4]),
+            'base_nps_scaled' : compute_nps(nps_stats[key][3], nps_stats[key][5]),
+        } for key, penta in bucket.items()]
+        return sorted(rows, key=lambda row: row['pairs'], reverse=True)
+
+    return {
+        'user'     : summarize(by_user, nps_user),
+        'cpu_name' : summarize(by_cpu,  nps_cpu),
+        'isa_name' : summarize(by_isa,  nps_isa),
+    }

@@ -1,5 +1,7 @@
 {% extends "OpenBench/base.html" %}
 
+{% block title %}{{ workload }}{% endblock %}
+
 {% load mytags %}
 {% load static %}
 
@@ -9,7 +11,7 @@
 
     <script>
         document.addEventListener('DOMContentLoaded', function() {
-            populate_results({{results|safe}});
+            fetch_summary({{workload.id}});
         });
     </script>
 
@@ -166,18 +168,23 @@
             <div class="form">
                 <div class="col-full">
 
-                    <div class="row">
+                    <div class="row workflow-edit">
+                        <label for="info">Info</label>
+                        <textarea id="info" name="info" rows="4">{{workload.info}}</textarea>
+                    </div>
+
+                    <div class="row workflow-edit">
                         <label for="priority">Priority</label>
                         <input value="{{workload.priority}}" id="priority" name="priority">
                     </div>
 
-                    <div class="row">
+                    <div class="row workflow-edit">
                         <label for="throughput">Throughput</label>
                         <input value="{{workload.throughput}}" id="throughput" name="throughput">
                     </div>
 
                     {% if type == "TEST" or type == "DATAGEN" %}
-                        <div class="row">
+                        <div class="row workflow-edit">
                             <label for="workload_size">Workload Size</label>
                             <input value="{{workload.workload_size}}" id="workload_size" name="workload_size">
                         </div>
@@ -225,16 +232,17 @@
         </div>
     {% endif %}
 
+    <!-- Aggregate pentanomial summary; fetched automatically on page load -->
+    <div id="summary-container" class="w-100 mt-3" style="float:left;"></div>
+
     <div id="results" class="w-100 mt-3" style="float:left;">
         <table class="stripes wrappable">
             <tr class="table-header">
                 <th>#</th>
                 <th>User</th>
-                <th>Updated</th>
                 <th style="width: 45px">Games</th>
-                <th style="width: 45px">Won</th>
-                <th style="width: 45px">Lost</th>
-                <th style="width: 45px">Drawn</th>
+                <th>Penta</th>
+                <th style="width: 45px">Pairs</th>
                 <th style="width: 45px">Time</th>
                 <th style="width: 45px">Crash</th>
             </tr>
@@ -244,10 +252,8 @@
             </tbody>
         </table>
 
-        <!-- Results were not provided, but we can fetch them on demand -->
-        {% if results_truncated %}
-            <button class="w-100 mt-1 anchorbutton btn-blue" type="submit" onclick="fetch_results({{workload.id}})">Fetch Results</button>
-        {% endif %}
+        <!-- Individual per-machine results are only ever fetched on demand -->
+        <button class="w-100 mt-1 anchorbutton btn-blue" type="submit" onclick="fetch_results({{workload.id}})">Fetch Individual Results</button>
     </div>
 
     </div>
