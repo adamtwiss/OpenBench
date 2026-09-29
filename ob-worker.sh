@@ -63,7 +63,10 @@ start() {
         echo "  Syzygy: $OB_SYZYGY (client will report the max piece count it finds)"
     fi
 
-    nohup python3 client.py \
+    # setsid: the client gets its OWN session and process group, so stop() can
+    # kill the whole tree (client -> fastchess-ob -> engines) as one unit. Without
+    # it the client inherits the process group of whatever shell ran `start`.
+    nohup setsid python3 client.py \
         -U "$OB_USER" \
         -P "$OB_PASS" \
         -S "$OB_SERVER" \
@@ -77,43 +80,83 @@ start() {
     echo "Started (PID $!, log: $OB_LOGFILE)"
 }
 
+# All descendants of $1 (children, grandchildren, ...), collected BEFORE anything
+# is killed: once the client dies its children are re-parented to init and can
+# no longer be found by parent PID. The old stop() killed the client and THEN
+# ran `pkill -P`, which raced the client's exit and left fastchess-ob running.
+descendants() {
+    local kids
+    kids=$(ps -o pid= --ppid "$1" 2>/dev/null)
+    for k in $kids; do
+        echo "$k"
+        descendants "$k"
+    done
+}
+
+# fastchess-ob processes whose working directory is inside this worker's Client
+# dir but which are NOT part of a live client's tree: left behind by an earlier
+# stop. Parent is not checked, because orphans are re-parented to a subreaper
+# (e.g. systemd --user) on many systems, not necessarily PID 1. The cwd check
+# matters: fastchess run by hand elsewhere (an H2H in ~/code/coda) is never touched.
+orphaned_fastchess() {
+    local LIVE=""
+    for C in $(pgrep -f '^([^ ]*/)?python[0-9.]* ([^ ]*/)?client\.py ' 2>/dev/null); do
+        LIVE="$LIVE $(descendants "$C" | tr "\n" " ")"
+    done
+    for P in $(pgrep -x fastchess-ob 2>/dev/null); do
+        case " $LIVE " in *" $P "*) continue ;; esac
+        CWD=$(readlink "/proc/$P/cwd" 2>/dev/null)
+        case "$CWD" in "$OB_DIR"|"$OB_DIR"/*) echo "$P" ;; esac
+    done
+}
+
+kill_tree() {
+    local ROOT="$1"
+    local PGID TREE ALL
+    PGID=$(ps -o pgid= -p "$ROOT" 2>/dev/null | tr -d ' ')
+    TREE=$(descendants "$ROOT")
+    ALL="$ROOT $TREE"
+    # Whole process group, if the client leads its own (started via setsid).
+    # Never signal a group we don't own: only when the group id IS the client.
+    if [ -n "$PGID" ] && [ "$PGID" = "$ROOT" ]; then
+        kill -TERM -- "-$PGID" 2>/dev/null
+    fi
+    kill -TERM $ALL 2>/dev/null
+    for i in $(seq 1 5); do
+        ALIVE=""
+        for P in $ALL; do kill -0 "$P" 2>/dev/null && ALIVE="$ALIVE $P"; done
+        [ -z "$ALIVE" ] && break
+        sleep 1
+    done
+    if [ -n "$ALIVE" ]; then
+        echo "Force killing:$ALIVE"
+        kill -KILL $ALIVE 2>/dev/null
+    fi
+}
+
 stop() {
-    if [ ! -f "$OB_PIDFILE" ]; then
-        # Try to find it anyway
-        PID=$(pgrep -f "client.py.*-I.*$(hostname)" | head -1)
-        if [ -n "$PID" ]; then
-            echo "Stopping OB worker (PID $PID, found via pgrep)"
-            kill "$PID" 2>/dev/null
-            # Also kill any child processes (cutechess, engines)
-            pkill -P "$PID" 2>/dev/null
-            rm -f "$OB_PIDFILE"
-            echo "Stopped"
-            return 0
-        fi
-        echo "OB worker not running (no PID file, no matching process)"
-        return 1
+    PID=""
+    if [ -f "$OB_PIDFILE" ] && kill -0 "$(cat "$OB_PIDFILE")" 2>/dev/null; then
+        PID=$(cat "$OB_PIDFILE")
+    else
+        # No live pidfile: find the client anyway (anchored on the interpreter so
+        # a shell merely mentioning client.py never matches)
+        PID=$(pgrep -f '^([^ ]*/)?(setsid )?python[0-9.]* ([^ ]*/)?client\.py ' | head -1)
     fi
 
-    PID=$(cat "$OB_PIDFILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "Stopping OB worker (PID $PID)"
-        kill "$PID" 2>/dev/null
-        # Also kill any child processes
-        pkill -P "$PID" 2>/dev/null
-        # Wait up to 5s for clean shutdown
-        for i in $(seq 1 5); do
-            if ! kill -0 "$PID" 2>/dev/null; then break; fi
-            sleep 1
-        done
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "Force killing..."
-            kill -9 "$PID" 2>/dev/null
-        fi
-        rm -f "$OB_PIDFILE"
+    if [ -n "$PID" ]; then
+        echo "Stopping OB worker (PID $PID) and its process tree"
+        kill_tree "$PID"
         echo "Stopped"
     else
-        echo "OB worker not running (stale PID file)"
-        rm -f "$OB_PIDFILE"
+        echo "OB worker not running"
+    fi
+    rm -f "$OB_PIDFILE"
+
+    ORPHANS=$(orphaned_fastchess)
+    if [ -n "$ORPHANS" ]; then
+        echo "Cleaning up orphaned fastchess-ob from an earlier stop: $ORPHANS"
+        for P in $ORPHANS; do kill_tree "$P"; done
     fi
 }
 
@@ -128,7 +171,8 @@ status() {
         else
             echo "  Syzygy: none ($OB_SYZYGY absent) — no EGTB workloads"
         fi
-        tail -1 "$OB_LOGFILE" 2>/dev/null | sed 's/^/  Last log: /'
+        tail -1 "$OB_LOGFILE" 2>/dev/null | sed 's/^/  Last log: /'; echo
+        echo "  fastchess-ob under this worker: $(descendants "$PID" | xargs -r ps -o comm= -p 2>/dev/null | grep -c '^fastchess')"
     else
         # Check for orphan process
         PID=$(pgrep -f "client.py.*-I" | head -1)
@@ -138,6 +182,8 @@ status() {
             echo "OB worker not running"
         fi
     fi
+    ORPHANS=$(orphaned_fastchess)
+    [ -n "$ORPHANS" ] && echo "  WARNING: orphaned fastchess-ob still running: $ORPHANS ('$0 stop' cleans them up)"
 }
 
 # Kill any client.py for this identity that is NOT the one recorded in the
