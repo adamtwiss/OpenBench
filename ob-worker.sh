@@ -175,7 +175,7 @@ status() {
         echo "  fastchess-ob under this worker: $(descendants "$PID" | xargs -r ps -o comm= -p 2>/dev/null | grep -c '^fastchess')"
     else
         # Check for orphan process
-        PID=$(pgrep -f "client.py.*-I" | head -1)
+        PID=$(pgrep -f '^([^ ]*/)?python[0-9.]* ([^ ]*/)?client\.py ' | head -1)
         if [ -n "$PID" ]; then
             echo "OB worker running (PID $PID, orphan — no PID file)"
         else
